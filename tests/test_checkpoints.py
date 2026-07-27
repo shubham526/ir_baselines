@@ -49,19 +49,22 @@ print('\nCheckpoint layouts')
 p1 = tmp()
 utils.save_checkpoint(p1, ref, {'t5_pooling': 'mean-all', 'model': 'cross-encoder'})
 m = Tiny()
-cfg = utils.load_checkpoint(p1, m, 'cpu')
+extras = utils.load_checkpoint(p1, m, 'cpu')
 check('wrapped layout loads', all(
     torch.equal(m.state_dict()[k], ref_sd[k]) for k in ref_sd))
-check('config comes back from the checkpoint', cfg.get('t5_pooling') == 'mean-all')
+# load_checkpoint returns everything the checkpoint carries, with the
+# architecture settings under 'config'.
+check('config comes back from the checkpoint',
+      extras.get('config', {}).get('t5_pooling') == 'mean-all')
 
 # 2. bare state_dict, as written by earlier versions
 p2 = tmp()
 torch.save(ref.state_dict(), p2)
 m = Tiny()
-cfg = utils.load_checkpoint(p2, m, 'cpu')
+extras = utils.load_checkpoint(p2, m, 'cpu')
 check('bare state_dict loads', all(
     torch.equal(m.state_dict()[k], ref_sd[k]) for k in ref_sd))
-check('bare state_dict reports no config', cfg == {})
+check('bare state_dict reports no extras', extras == {})
 
 # 3. 't5.'-prefixed keys
 p3 = tmp()

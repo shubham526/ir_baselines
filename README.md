@@ -1,160 +1,175 @@
 # ir_baselines
 
-Neural re-ranking baselines used in:
+Neural re-ranking baselines for ad hoc document retrieval, trained and
+evaluated under one protocol so that comparisons between them are controlled.
 
-- **DREQ** — Chatterjee, Mackie & Dalton. *DREQ: Document Re-ranking Using
-  Entity-based Query Understanding.* ECIR 2024.
-- **QDER** — Chatterjee & Dalton. *Query-Specific Document and Entity
-  Representations for Multi-Vector Document Re-Ranking.* SIGIR 2025.
-
-Both papers compare against the same baselines, trained by this code under one
-protocol. The baseline run files are byte-identical between them on every
-collection, so this repository is the single source for those rows rather than
-a copy in each paper's repository.
-
-**This tag is `v1.0-as-published`.** It is the code that produced the released
-runs, with only those fixes that cannot change a score. Anything that would
-change a number is listed in [`docs/known-issues.md`](docs/known-issues.md)
-and fixed in `v2.0`. Cite whichever tag matches what you are doing:
-
-| If you want to | Use |
-|---|---|
-| reproduce the published rows | `v1.0-as-published` |
-| build on this code | `v2.0` |
-
----
-
-## What is here
-
-| `--model` | Class | Published rows |
-|---|---|---|
-| `cross-encoder` | `CrossEncoder` | BERT, RoBERTa, DeBERTa, ELECTRA, ConvBERT, RankT5, ERNIE |
-| `me-bert` | `MEBERT` | ME-BERT (QDER Table 1) |
-| `poly-encoder` | `PolyEncoder` | Poly-encoder (QDER Table 1) |
-
-The seven cross-encoder rows are one class over different encoders, selected
-with `--pretrain`.
-
-**From OpenMatch.** KNRM, ConvKNRM and EDRM were run with
-[OpenMatch](https://github.com/thunlp/OpenMatch/tree/master/v1) (`master`
-branch, `v1/` directory), not with code in this repository. Only the `task`
-argument was dropped, since these papers use ranking alone. The methods
-themselves are Xiong et al. (SIGIR 2017), Dai et al. (WSDM 2018) and Liu et
-al. (ACL 2018).
-
-**Not here.** PARADE, CEDR, ColBERT v2, SPLADE, ANCE-MaxP, EQFE and MaxSimCos
-also appear in those papers' tables. They came from public run files, from
-their authors' released implementations, or from separate code. The artifact
-packages on each paper's data page hold the runs for every row, including
-those.
-
-**ME-BERT and Poly-encoder are our own implementations**, written from the
-descriptions in their papers, since neither has a released implementation for
-ad hoc document ranking. They are trained here under the pointwise objective
-shared with the other baselines rather than the softmax cross-entropy over
-sampled negatives their papers use, so the comparison is controlled but the
-figures are not what the original authors would report. Their scoring
-functions are also defective in this tag — see
-[`docs/known-issues.md`](docs/known-issues.md).
-
----
-
-## Structure
-
-```
-src/
-  models/
-    base.py            the contract: ENCODING, LOSS, score()
-    cross_encoder.py   CrossEncoder
-    multi_vector.py    MEBERT, PolyEncoder
-    __init__.py        registry and shared arguments
-  data/
-    dataset.py         one dataset, 'pair' and 'dual' encoding
-    dataloader.py
-  train.py  test.py  trainer.py  evaluate.py  metrics.py  utils.py
-tests/
-  test_scoring.py      einsums against the published expressions
-  test_encoding.py     both encoding modes, token_type_ids fallback
-  test_checkpoints.py  all three checkpoint layouts
+```bash
+pip install -e .
+python -m ir_baselines.train --list-models
 ```
 
-The two families differ only in how a pair reaches the model and in what the
-score means. Each model declares both — `ENCODING` is `pair` or `dual`, `LOSS`
-is `cross_entropy` or `bce`, and `score()` returns the value written to the
-run file — so the dataset, trainer and evaluator do not branch on the model.
+```
+model         encoding  loss           in-batch  summary
+------------  --------  -------------  --------  ----------------------------------------------------
+bert          pair      cross-entropy  False     Cross-encoder over BERT-base
+conv-bert     pair      cross-entropy  False     Cross-encoder over ConvBERT-base
+deberta       pair      cross-entropy  False     Cross-encoder over DeBERTa-base
+electra       pair      cross-entropy  False     Cross-encoder over ELECTRA-small
+ernie         pair      cross-entropy  False     Cross-encoder over ERNIE 2.0 base
+me-bert       dual      bce            True      One query vector, m document vectors, max inner product
+              Luan et al., TACL 2021. Our implementation; see docs/models.md for the reproduction choices.
+poly-encoder  dual      bce            True      m learned codes attend over the query
+              Humeau et al., ICLR 2020. Our implementation; see docs/models.md for the reproduction choices.
+rankt5        pair      cross-entropy  False     Cross-encoder over the T5 encoder
+              T5 has no sequence-start representation, so hidden states are pooled by mean. See --t5-pooling.
+roberta       pair      cross-entropy  False     Cross-encoder over RoBERTa-base
 
----
+encoding  how the pair is tokenized: pair = one sequence, dual = query and document separately
+in-batch  whether --loss ce-inbatch is available
+```
 
 ## Usage
 
-Input is one JSON object per line:
+```bash
+python -m ir_baselines.train \
+  --model rankt5 \
+  --train fold-0/train.jsonl --dev fold-0/dev.jsonl --qrels fold-0/dev.qrels \
+  --save-dir out/rankt5/fold-0 \
+  --epoch 10 --batch-size 16 --use-cuda
 
-```
-train   {"query": ..., "doc": ..., "label": 0|1}
-test    {"query_id": ..., "doc_id": ..., "query": ..., "doc": ..., "label": 0|1}
+python -m ir_baselines.test \
+  --model rankt5 \
+  --test fold-0/test.jsonl --checkpoint out/rankt5/fold-0/model.bin \
+  --save-dir runs/rankt5 --run fold-0.run \
+  --qrels fold-0/test.qrels --use-cuda
 ```
 
-Train:
+Five folds, train through scoring:
 
 ```bash
-python src/train.py \
-  --model cross-encoder --pretrain t5 \
-  --train fold-0/train.jsonl --dev fold-0/dev.jsonl \
-  --qrels qrels.txt --save-dir out/t5/fold-0 \
-  --epoch 4 --batch-size 10 --learning-rate 2e-5 --use-cuda
+MODEL=rankt5 DATA=./fold_data QRELS=./qrels.txt OUT=./runs \
+  bash scripts/run_5fold.sh
 ```
 
-Test:
+Input is one JSON object per line — `{"query", "doc", "label"}` for training,
+plus `query_id` and `doc_id` for evaluation. See
+[docs/quickstart.md](docs/quickstart.md).
+
+## What is here
+
+| | |
+|---|---|
+| **cross-encoder** | one encoder over the concatenated pair, with a classifier on the pooled representation. Seven of the nine entries above. |
+| **ME-BERT** | Luan et al., TACL 2021. One query vector against *m* document vectors, scored by maximum inner product. |
+| **Poly-encoder** | Humeau et al., ICLR 2020. *m* learned codes attend over the query; the document vector then attends over those *m*. |
+| **entity baselines** | `ir_baselines.entity.exact_match` and `ir_baselines.entity.pairwise_sim`, which score by entity overlap and entity-embedding similarity. |
+
+Where a paper leaves a detail unspecified, the choice is a constructor argument
+marked `REPRODUCTION CHOICE` in the source and documented in
+[docs/models.md](docs/models.md), so it can be reported alongside a result.
+
+**Not here:** KNRM, ConvKNRM and EDRM — use
+[OpenMatch](https://github.com/thunlp/OpenMatch/tree/master/v1), which
+implements all three faithfully. ColBERT, whose query augmentation depends on an
+attention implementation this package does not pin. Both explained in
+[docs/models.md](docs/models.md).
+
+## Reproducibility
+
+Every checkpoint records what produced it:
+
+```python
+import torch
+ck = torch.load('out/model.bin', weights_only=False)
+ck['provenance']['git']                # commit, branch, and whether dirty
+ck['provenance']['environment']        # torch, CUDA, transformers, GPU, host
+ck['provenance']['data']               # size, lines and SHA-256 per input file
+ck['config']                           # architecture, verified on load
+ck['epoch'], ck['best_metric']         # where the run got to
+```
+
+The data digest is the part that earns its place: regenerating training data
+with a different negative sample gives a file of the same size and line count
+and different contents, and nothing else would notice.
+
+**Training is seeded.** Two runs with the same `--seed` produce byte-identical
+run files, including identical per-epoch losses.
+
+**Interrupted runs resume exactly.** `--resume` restores the optimiser,
+scheduler, scaler, epoch counter, best metric, history and random state, so the
+continued run sees the data order the original would have seen. Restoring the
+seed alone would reproduce step zero, not the step training stopped at.
+`last.bin` is the latest state and is what `--resume` should point at;
+`model.bin` is the best model and is what inference should use.
+
+**Run files carry provenance too.** `test.py` writes a sibling
+`<run>.provenance.json` recording the run's own digest, what produced it, and
+what trained the checkpoint behind it — a run file cannot hold its own record,
+since every TREC parser rejects a comment line. `--tag-commit` additionally
+writes the short commit into field 6, for a run that gets separated from its
+sibling. Read either with:
 
 ```bash
-python src/test.py \
-  --model cross-encoder --pretrain t5 \
-  --test fold-0/test.jsonl \
-  --checkpoint out/t5/fold-0/model.bin \
-  --save-dir runs/ --run fold-0.run --use-cuda
+python -m ir_baselines.inspect out/model.bin
+python -m ir_baselines.inspect runs/fold-0.run
 ```
 
-Then concatenate the five folds and score with `trec_eval`. Which flag to use
-differs by collection — CODEC is `-Jc`, the others are `-c` — and the expected
-numbers are on each paper's wiki.
+**Mismatches are refused rather than warned about.** A checkpoint whose
+configuration disagrees with the current settings, a resume whose input files
+have changed, an objective the model cannot consume: each of these otherwise
+produces a number that looks fine and is not.
 
-### T5 pooling
+## Design
 
-T5 has no sequence-start representation, so its hidden states are averaged.
-`--t5-pooling mean-all` averages over every position including padding and is
-what produced the published runs; `--t5-pooling masked-mean` excludes padding.
-The setting is stored in the checkpoint and checked at inference, because a
-mismatch loads cleanly and changes every score.
+The two model families differ in how a pair reaches the model and in what the
+score means, and in nothing else. Each model declares both, so one dataset, one
+trainer and one evaluator serve all of them:
 
----
+```python
+ENCODING = 'pair'            # or 'dual'
+LOSS = 'cross-entropy'       # or 'bce'
+SUPPORTS_INBATCH = False
+```
+
+Most of the rest of the code exists to catch failures that are otherwise
+silent — a run missing topics scores *higher*, not lower; a checkpoint can load
+into the wrong architecture with every key matched. Those are set out in
+[docs/design.md](docs/design.md).
 
 ## Tests
 
 ```bash
-python tests/test_encoding.py
-python tests/test_checkpoints.py
-python tests/test_scoring.py     # fails in this tag, by design
+pip install -e ".[test]"
+pytest                    # everything, about four minutes
+pytest -m "not slow"      # skip the ones that train, about seven seconds
 ```
 
-`test_scoring.py` compares the multi-vector scoring functions against explicit
-implementations of the expressions in their papers. In this tag both fail;
-that is the record of the defect described in
-[`docs/known-issues.md`](docs/known-issues.md), not a broken test. The first
-two run without model weights and without network access.
+| | |
+|---|---|
+| `test_scoring.py` | both models' scoring against explicit loop implementations of the paper equations, plus dtype safety and the input guards |
+| `test_dispatch.py` | each `forward` signature against the batch key order the trainer uses, and every objective/encoding combination |
+| `test_encoding.py` | both encodings, the `token_type_ids` fallback, and the load-time validations |
+| `test_checkpoints.py` | every checkpoint layout, including the legacy prefix |
+| `test_provenance.py` | git parsing, data digests, RNG round-trip, run siblings |
+| `test_end_to_end.py` | the entry points as a user runs them, against a real tokenizer and a small real model. Marked `slow`. |
 
----
+Nothing downloads. The end-to-end tests build a two-layer BERT from a config
+and register it through `IR_BASELINES_ENCODERS`, so the suite runs offline.
 
-## Runs and checkpoints
+The end-to-end assertions are about exit status and written artifacts rather
+than about metrics: a few dozen synthetic examples say nothing about quality,
+and the point is that the pipeline is wired correctly and the guards fire.
 
-Not in this repository. The run files behind every published row, together
-with a script that scores them against the paper, are on each paper's data
-page:
+## Documentation
 
-- [DREQ](https://github.com/shubham526/ECIR2024-DREQ/wiki/Data)
-- [QDER](https://github.com/shubham526/SIGIR2025-QDER/wiki/Data)
-
----
+| | |
+|---|---|
+| [quickstart.md](docs/quickstart.md) | install, data format, the flags that matter |
+| [models.md](docs/models.md) | each model, its reproduction choices, and the objectives |
+| [design.md](docs/design.md) | why the code is shaped this way |
+| [reproducing-papers.md](docs/reproducing-papers.md) | for figures from papers that used earlier versions |
+| [CHANGELOG.md](CHANGELOG.md) | what changed between releases, and why |
 
 ## Licence
 
-MIT. See [`LICENSE`](LICENSE).
+MIT.

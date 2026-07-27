@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ir-baselines"
-version = "1.0.0"
+version = "2.0.0"
 description = "Neural re-ranking baselines used in the DREQ (ECIR 2024) and QDER (SIGIR 2025) papers"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,6 +26,9 @@ dependencies = [
     "scikit-learn",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [project.urls]
 Homepage = "https://github.com/shubham526/ir-baselines"
 DREQ = "https://github.com/shubham526/ECIR2024-DREQ"
@@ -36,3 +39,11 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra reports why anything was skipped or failed; the default hides it.
+addopts = "-ra"
+markers = [
+    "slow: trains a model. Deselect with -m 'not slow'.",
+]

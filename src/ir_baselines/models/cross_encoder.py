@@ -1,75 +1,135 @@
 """
-Cross-encoder baselines.
+Cross-encoder re-ranking baseline.
 
-One BERT-family encoder over the concatenated (query, document) sequence,
-with a two-way classifier on the pooled representation. The published rows for
-BERT, RoBERTa, DeBERTa, ELECTRA, ConvBERT, RankT5, KNRM, EDRM and ERNIE were
-produced by this class; the encoder is chosen with --pretrain.
+One encoder over the concatenated (query, document) sequence, with a two-way
+classifier on the pooled representation. This single class covers seven rows
+of the published tables -- BERT, RoBERTa, DeBERTa, ELECTRA, ConvBERT, RankT5
+and ERNIE -- which differ only in which pretrained encoder they wrap.
+
+Because the query and the document are encoded together there is no separate
+query representation to cache, so in-batch negative training is not available:
+SUPPORTS_INBATCH is False and the objective is always cross-entropy over the
+two-way classifier.
 """
+
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel, DistilBertModel, T5EncoderModel
 
-from .base import BaselineRanker, mean_all, masked_mean
+from .base import BaselineRanker, masked_mean, mean_all
+
+T5_POOLING_CHOICES = ('mean-all', 'masked-mean')
 
 
 class CrossEncoder(BaselineRanker):
+    """
+    Pooling depends on the encoder family:
+
+        BERT and family   the sequence-start position of the last hidden state
+        DistilBERT        the same; the model takes no token_type_ids
+        T5                the mean of the last hidden state, see below
+
+    T5 POOLING. T5 has no sequence-start representation to pool, so the hidden
+    states are averaged. Two behaviours are available:
+
+        'mean-all'     average over every position, padding included. This is
+                       what produced the published T5 runs, and the default.
+        'masked-mean'  average over non-padding positions only.
+
+    The difference is not cosmetic: on a 185-token document padded to 512,
+    roughly two thirds of the averaged positions are padding. The setting is
+    recorded in config_dict(), stored in the checkpoint, and verified at
+    inference, because a checkpoint trained under one pooling and evaluated
+    under the other loads with every key matched and produces different scores
+    throughout.
+    """
+
     ENCODING = 'pair'
-    LOSS = 'cross_entropy'
+    LOSS = 'cross-entropy'
+    SUPPORTS_INBATCH = False
 
-    def __init__(self, pretrained: str, t5_pooling: str = 'mean-all'):
-        """
-        t5_pooling
-            'mean-all'     mean over all positions including padding. This is
-                           what produced the published runs and is the
-                           default.
-            'masked-mean'  mean over non-padding positions only.
-
-        The choice changes every score a T5 model produces, so it is stored in
-        the checkpoint and checked at inference time. It has no effect on any
-        other encoder, which pool by taking the sequence-start position.
-        """
+    def __init__(
+            self,
+            pretrained: str,
+            t5_pooling: str = 'mean-all',
+    ) -> None:
         super().__init__()
-        if t5_pooling not in ('mean-all', 'masked-mean'):
-            raise ValueError(f"t5_pooling must be 'mean-all' or 'masked-mean', got {t5_pooling!r}")
+        if t5_pooling not in T5_POOLING_CHOICES:
+            raise ValueError(
+                f't5_pooling must be one of {T5_POOLING_CHOICES}, received {t5_pooling!r}'
+            )
+
         self.pretrained = pretrained
         self.t5_pooling = t5_pooling
-        self.config = AutoConfig.from_pretrained(self.pretrained)
+        self.config = AutoConfig.from_pretrained(pretrained)
         self.classifier = nn.Linear(self.config.hidden_size, 2)
-        if pretrained == 't5-base':
-            self.encoder = T5EncoderModel.from_pretrained(self.pretrained, config=self.config)
-        else:
-            self.encoder = AutoModel.from_pretrained(self.pretrained, config=self.config)
 
-    def forward(self, input_ids, attention_mask, token_type_ids):
+        # T5EncoderModel rather than AutoModel: AutoModel would build the full
+        # encoder-decoder and the decoder weights would be unused.
+        #
+        # Dispatch on config.model_type rather than on the checkpoint name. A
+        # substring test for 't5' would misfire on any unrelated model whose
+        # name happens to contain it, and would miss a T5 checkpoint under a
+        # name that does not.
+        self.is_t5 = self.config.model_type == 't5'
+        if self.is_t5:
+            self.encoder = T5EncoderModel.from_pretrained(pretrained, config=self.config)
+        else:
+            self.encoder = AutoModel.from_pretrained(pretrained, config=self.config)
+
+    # -- pooling -----------------------------------------------------------
+
+    def _pool(self, input_ids, attention_mask, token_type_ids) -> torch.Tensor:
         if isinstance(self.encoder, DistilBertModel):
             # DistilBERT takes no token_type_ids.
-            output = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = output.last_hidden_state[:, 0, :]
-        elif isinstance(self.encoder, T5EncoderModel):
-            # T5 has no sequence-start representation to pool, so the hidden
-            # states are averaged. See t5_pooling above.
-            last_hidden_state = self.encoder(
-                input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            return out.last_hidden_state[:, 0, :]
+
+        if isinstance(self.encoder, T5EncoderModel):
+            h = self.encoder(
+                input_ids=input_ids, attention_mask=attention_mask
+            ).last_hidden_state
             if self.t5_pooling == 'masked-mean':
-                pooled = masked_mean(last_hidden_state, attention_mask)
-            else:
-                pooled = mean_all(last_hidden_state)
-        else:
-            output = self.encoder(input_ids=input_ids, attention_mask=attention_mask,
-                                  token_type_ids=token_type_ids)
-            pooled = output.last_hidden_state[:, 0, :]
+                return masked_mean(h, attention_mask)
+            return mean_all(h)
 
-        score = self.classifier(pooled).squeeze(-1)
-        return score, pooled
+        out = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        )
+        return out.last_hidden_state[:, 0, :]
 
-    def score(self, batch, device):
-        logits, _ = self.forward(
-            *self._to(batch, device, 'input_ids', 'attention_mask', 'token_type_ids'))
-        # The run file records the probability of the relevant class, not the
-        # raw logit.
-        return logits.softmax(dim=-1)[:, 1].squeeze(-1)
+    # -- contract ----------------------------------------------------------
 
-    def config_dict(self):
-        return {'pretrained': self.pretrained, 't5_pooling': self.t5_pooling}
+    def forward(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            token_type_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """-> [B, 2] logits, for cross-entropy against a class index."""
+        pooled = self._pool(input_ids, attention_mask, token_type_ids)
+        return self.classifier(pooled)
+
+    def score(self, batch: Dict[str, Any], device) -> torch.Tensor:
+        """
+        -> [B], the probability of the relevant class.
+
+        The run file records the softmax probability rather than the raw
+        logit. Ranking is unchanged by the transform for a single query, but
+        the written scores are what a reader sees, and they were produced this
+        way.
+        """
+        logits = self.forward(*self._batch_to(
+            batch, device, 'input_ids', 'attention_mask', 'token_type_ids'))
+        return logits.softmax(dim=-1)[:, 1]
+
+    def config_dict(self) -> Dict[str, Any]:
+        return {
+            'model': 'cross-encoder',
+            'pretrained': self.pretrained,
+            't5_pooling': self.t5_pooling,
+        }
