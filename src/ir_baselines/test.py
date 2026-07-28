@@ -30,6 +30,12 @@ def main():
                         help='Run tag written in field 6. Default: the model name.')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Truncate each ranking to K documents. Default: no truncation.')
+    parser.add_argument('--judged-only', action='store_true',
+                        help='Score with unjudged documents removed from the '
+                             'ranking rather than counted as non-relevant -- '
+                             'trec_eval -J. Some collections are reported that '
+                             'way, and where the judgment pool is shallow the '
+                             'difference is large. Off by default, matching -c.')
     parser.add_argument('--qrels', type=str, default=None,
                         help='Optional qrels; if given, the run is scored and its topic '
                              'set is checked against the qrels.')
@@ -197,8 +203,11 @@ def main():
                 f'wrong ids passes a count check and fails this one. Pass '
                 f'--allow-partial to score anyway.'
             )
-        agg, scored, qrels_topics, _ = metrics.get_all_metrics(args.qrels, run_path)
-        print(f'Scored {len(scored)} of {len(qrels_topics)} qrels topics.')
+        agg, scored, qrels_topics, _ = metrics.get_all_metrics(
+            args.qrels, run_path, judged_only=args.judged_only)
+        convention = 'trec_eval -Jc' if args.judged_only else 'trec_eval -c'
+        print(f'Scored {len(scored)} of {len(qrels_topics)} qrels topics '
+              f'({convention}).')
         if scored != qrels_topics:
             unscored = qrels_topics - scored
             print(f'NOTE  {len(unscored)} qrels topics are absent from the run '

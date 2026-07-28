@@ -13,7 +13,7 @@ from .trainer import LOSS_CHOICES, Trainer
 
 
 def train(model, trainer, epochs, metric, qrels, valid_loader, save_path, save,
-          run_file, eval_every, device, config, history_file,
+          run_file, eval_every, device, config, history_file, judged_only=False,
           optimizer=None, scheduler=None, scaler=None, prov=None,
           start_epoch=0, best_valid_metric=-1.0, history=None,
           save_last=None):
@@ -44,7 +44,8 @@ def train(model, trainer, epochs, metric, qrels, valid_loader, save_path, save,
         # the wrong ones is the usual cause. build_data writes them per fold.
         agg = metrics.require_full_coverage(
             qrels, run_path, context='validation run',
-            measures=tuple(dict.fromkeys((metric, *metrics.DEFAULT_MEASURES))))
+            measures=tuple(dict.fromkeys((metric, *metrics.DEFAULT_MEASURES))),
+            judged_only=judged_only)
         valid_metric = agg[metric]
 
         history['epoch'].append(epoch + 1)
@@ -115,6 +116,12 @@ def main():
                              'the checkpoint was trained on.')
     parser.add_argument('--run', help='Validation run filename. Default: dev.run',
                         default='dev.run', type=str)
+    parser.add_argument('--judged-only', action='store_true',
+                        help='Score with unjudged documents removed from the '
+                             'ranking rather than counted as non-relevant -- '
+                             'trec_eval -J. Some collections are reported that '
+                             'way, and where the judgment pool is shallow the '
+                             'difference is large. Off by default, matching -c.')
     parser.add_argument('--metric', default='AP', type=str,
                         help='Validation metric, as an ir_measures name: AP, '
                              'nDCG@20, P@20, RR. The trec_eval spellings (map, '
@@ -331,7 +338,8 @@ def main():
     config = {
         **arch,
         'loss': loss, 'positives_only': args.positives_only,
-        'metric': args.metric, 'epochs': args.epoch, 'batch_size': args.batch_size,
+        'metric': args.metric, 'judged_only': args.judged_only,
+        'epochs': args.epoch, 'batch_size': args.batch_size,
         'learning_rate': args.learning_rate, 'weight_decay': args.weight_decay,
         'warmup_steps': warmup, 'total_steps': total_steps,
         'max_grad_norm': args.max_grad_norm, 'train_amp': args.amp, 'seed': args.seed,
@@ -350,6 +358,7 @@ def main():
         save=args.save, run_file=args.run, eval_every=args.eval_every,
         device=device, config=config,
         history_file=os.path.join(args.save_dir, 'training_history.json'),
+        judged_only=args.judged_only,
         optimizer=optimizer, scheduler=scheduler, scaler=trainer._scaler,
         prov=prov, start_epoch=start_epoch, best_valid_metric=best_metric,
         history=history, save_last=args.save_last or None,
