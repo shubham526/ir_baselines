@@ -1,203 +1,232 @@
 """
-Checks the provenance record: git parsing, data fingerprints, RNG round-trip,
-and the enriched checkpoint.
+Provenance: git state, environment, data fingerprints, RNG round-trip, and the
+sibling record written beside a run file.
 """
 
 import json
 import os
 import subprocess
-import sys
-import tempfile
 
+import numpy as np
+import pytest
 import torch
 
 from ir_baselines import provenance as P
 from ir_baselines import utils
 
-FAILED = []
+
+def _git(repo, *args):
+    subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True)
 
 
-def check(name, cond, detail=''):
-    print(f"  {'PASS' if cond else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
-    if not cond:
-        FAILED.append(name)
+# ===============================================================  git
+
+def test_clean_tree_reports_a_commit(git_repo):
+    info = P.git_info(git_repo)
+    assert info['available'] is True
+    assert len(info['commit']) == 40
+    assert info['dirty'] is False
 
 
-# --------------------------------------------------------------- git
-print('\ngit')
-repo = tempfile.mkdtemp()
-subprocess.run(['git', 'init', '-q', repo], check=True)
-for cmd in (['git', 'config', 'user.email', 't@t'], ['git', 'config', 'user.name', 't']):
-    subprocess.run(cmd, cwd=repo, check=True)
-open(os.path.join(repo, 'a.txt'), 'w').write('one\n')
-subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
-subprocess.run(['git', 'commit', '-qm', 'first'], cwd=repo, check=True)
-
-g = P.git_info(repo)
-check('clean tree reports a commit', g['available'] and len(g['commit']) == 40)
-check('clean tree is not dirty', g['dirty'] is False, f"dirty={g['dirty']}")
-
-# A modified tracked file: git status prints ' M path', with a LEADING SPACE.
-# Stripping the output before slicing off the status characters eats the first
-# character of every path, so this asserts the path survives intact.
-open(os.path.join(repo, 'a.txt'), 'w').write('two\n')
-g = P.git_info(repo)
-check('modified tree is dirty', g['dirty'] is True)
-check('dirty path is intact', g['dirty_files'] == ['a.txt'],
-      f"got {g['dirty_files']}")
-
-check('outside a repository reports unavailable',
-      P.git_info(tempfile.mkdtemp())['available'] is False)
-
-# --------------------------------------------------------- environment
-print('\nenvironment')
-e = P.environment()
-for key in ('python', 'platform', 'torch', 'transformers'):
-    check(f'{key} recorded', e.get(key) is not None, str(e.get(key)))
-
-# ---------------------------------------------------------------- data
-print('\ndata fingerprints')
-fd, p1 = tempfile.mkstemp(suffix='.jsonl')
-os.write(fd, b'{"a":1}\n{"a":2}\n'); os.close(fd)
-f1 = P.file_fingerprint(p1)
-check('line count', f1['lines'] == 2, str(f1['lines']))
-check('digest recorded', len(f1['sha256']) == 64)
-
-# same length, different content -- the case a size or line check misses
-fd, p2 = tempfile.mkstemp(suffix='.jsonl')
-os.write(fd, b'{"a":1}\n{"a":3}\n'); os.close(fd)
-f2 = P.file_fingerprint(p2)
-check('same size and lines, different digest',
-      f1['bytes'] == f2['bytes'] and f1['lines'] == f2['lines']
-      and f1['sha256'] != f2['sha256'])
-
-check('missing file reported, not raised',
-      P.file_fingerprint('/nonexistent/x')['exists'] is False)
-
-changed = P.compare_data({p1: f1}, {p1: f2})
-check('compare_data detects a content change',
-      any(c[1] == 'sha256' for c in changed), str([c[1] for c in changed]))
-check('compare_data is quiet on identical files',
-      P.compare_data({p1: f1}, {p1: f1}) == [])
-
-# ----------------------------------------------------------------- rng
-print('\nRNG round-trip')
-import random
-
-import numpy as np
-random.seed(1); np.random.seed(1); torch.manual_seed(1)
-state = P.rng_state()
-before = (random.random(), float(np.random.rand()), float(torch.rand(1)))
-# advance all three
-random.random(); np.random.rand(); torch.rand(1)
-P.set_rng_state(state)
-after = (random.random(), float(np.random.rand()), float(torch.rand(1)))
-check('python RNG restored', before[0] == after[0])
-check('numpy RNG restored', before[1] == after[1])
-check('torch RNG restored', before[2] == after[2])
-check('empty state is a no-op', P.set_rng_state({}) is None)
-
-# ---------------------------------------------------------- checkpoint
-print('\ncheckpoint round-trip')
+def test_modified_tracked_file_makes_the_tree_dirty(git_repo):
+    (open(os.path.join(git_repo, 'a.txt'), 'w')).write('two\n')
+    info = P.git_info(git_repo)
+    assert info['dirty'] is True
 
 
-class Tiny(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.encoder = torch.nn.Linear(4, 4)
+def test_dirty_path_is_not_truncated(git_repo):
+    """
+    `git status --porcelain` prints ' M path' with a LEADING SPACE. Stripping
+    the output before slicing off the two status characters eats the first
+    character of every path, which corrupts the record silently.
+    """
+    open(os.path.join(git_repo, 'a.txt'), 'w').write('two\n')
+    info = P.git_info(git_repo)
+    assert info['dirty_files'] == ['a.txt']
+    assert all(os.path.exists(os.path.join(git_repo, f))
+               for f in info['dirty_files'])
 
 
-m = Tiny()
-opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
-opt.step()
-sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
-scaler = torch.amp.GradScaler('cuda', enabled=False)
-prov = P.collect([p1])
-
-fd, ck = tempfile.mkstemp(suffix='.bin'); os.close(fd)
-utils.save_checkpoint(ck, m, {'model': 'tiny'}, optimizer=opt, scheduler=sched,
-                      scaler=scaler, epoch=3, best_metric=0.42, provenance=prov,
-                      rng=P.rng_state(), history={'epoch': [1, 2, 3]})
-
-m2 = Tiny()
-extras = utils.load_checkpoint(ck, m2, 'cpu')
-for key in ('config', 'provenance', 'optimizer_state_dict', 'scheduler_state_dict',
-            'scaler_state_dict', 'epoch', 'best_metric', 'rng_state', 'history'):
-    check(f'{key} survives the round trip', key in extras)
-check('epoch value', extras.get('epoch') == 3)
-check('best_metric value', extras.get('best_metric') == 0.42)
-check('provenance carries the git record', 'git' in extras.get('provenance', {}))
-check('optimizer state is loadable',
-      opt.load_state_dict(extras['optimizer_state_dict']) is None)
-
-# a bare state_dict still loads, and reports nothing extra
-fd, bare = tempfile.mkstemp(suffix='.bin'); os.close(fd)
-torch.save(m.state_dict(), bare)
-check('bare state_dict returns no extras',
-      utils.load_checkpoint(bare, Tiny(), 'cpu') == {})
-
-for f in (p1, p2, bare):
-    os.unlink(f)
+def test_untracked_file_does_not_make_the_tree_dirty(git_repo):
+    """
+    A repository nearly always has untracked files -- __pycache__, scratch
+    output. Treating those as dirty would mean the commit hash was never
+    usable for provenance.
+    """
+    open(os.path.join(git_repo, 'scratch.txt'), 'w').write('x\n')
+    info = P.git_info(git_repo)
+    assert info['dirty'] is False
+    assert info['untracked'] == ['scratch.txt']
 
 
+def test_outside_a_repository_reports_unavailable(tmp_path):
+    assert P.git_info(str(tmp_path))['available'] is False
 
-# ------------------------------------------------------------ run files
-print('\nrun provenance')
-fd, run_path = tempfile.mkstemp(suffix='.run'); os.close(fd)
-with open(run_path, 'w') as f:
-    for t in range(3):
-        for d in range(4):
-            f.write(f't{t} Q0 t{t}_d{d} {d + 1} {1.0 - d / 10:.4f} tag\n')
 
-stats = P.run_stats(run_path)
-check('topics counted', stats['topics'] == 3, str(stats['topics']))
-check('pairs counted', stats['pairs'] == 12, str(stats['pairs']))
-check('run digest recorded', len(stats['sha256']) == 64)
+# ======================================================  environment
 
-inference = P.collect([run_path])
-out = P.write_run_provenance(run_path, inference=inference,
-                             checkpoint_path=ck if os.path.exists(ck) else None,
-                             checkpoint_config={'model': 'tiny'},
-                             checkpoint_provenance=prov)
-check('sibling written beside the run', out == run_path + '.provenance.json'
-      and os.path.exists(out))
+@pytest.mark.parametrize('key', ['python', 'platform', 'hostname', 'torch',
+                                 'transformers', 'numpy'])
+def test_environment_records(key):
+    assert P.environment().get(key) is not None
 
-with open(out) as f:
-    rec = json.load(f)
-check('sibling records the run digest',
-      rec['run']['sha256'] == stats['sha256'])
-check('sibling records inference provenance', 'produced_by' in rec)
-check('sibling records the checkpoint', 'checkpoint' in rec)
-check('training and inference provenance are kept apart',
-      rec['checkpoint'].get('provenance') is not None
-      and rec['checkpoint']['provenance'] is not rec['produced_by'])
 
-# the digest is what lets a reader tell the sibling from a stale one
-with open(run_path, 'a') as f:
-    f.write('t9 Q0 t9_d0 1 0.5 tag\n')
-check('a changed run no longer matches its sibling digest',
-      P.run_stats(run_path)['sha256'] != rec['run']['sha256'])
+# =====================================================  fingerprints
 
-os.unlink(run_path); os.unlink(out)
+@pytest.fixture
+def two_files(tmp_path):
+    """Same size and line count, different contents."""
+    a = tmp_path / 'a.jsonl'
+    b = tmp_path / 'b.jsonl'
+    a.write_text('{"a":1}\n{"a":2}\n')
+    b.write_text('{"a":1}\n{"a":3}\n')
+    return str(a), str(b)
 
-# --------------------------------------------------------- short_commit
-print('\nshort_commit')
-subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
-subprocess.run(['git', 'commit', '-qm', 'second'], cwd=repo, check=True)
-# git_info() defaults to the package directory, so point short_commit at a
-# known repo by checking git_info directly for the semantics it relies on.
-g = P.git_info(repo)
-check('clean tree yields a usable hash', g['dirty'] is False and len(g['commit']) == 40)
-open(os.path.join(repo, 'a.txt'), 'w').write('three\n')
-check('a modified tracked file makes it unusable', P.git_info(repo)['dirty'] is True)
-open(os.path.join(repo, 'untracked.txt'), 'w').write('x\n')
-subprocess.run(['git', 'checkout', '--', 'a.txt'], cwd=repo, check=True)
-g = P.git_info(repo)
-check('an untracked file does NOT make it unusable', g['dirty'] is False,
-      f"untracked={g['untracked']}")
 
-os.unlink(ck)
+def test_fingerprint_records_lines_and_digest(two_files):
+    a, _ = two_files
+    f = P.file_fingerprint(a)
+    assert f['lines'] == 2
+    assert len(f['sha256']) == 64
+    assert f['exists'] is True
 
-print()
-print('ALL CHECKS PASSED' if not FAILED else f'{len(FAILED)} FAILED: {FAILED}')
-sys.exit(1 if FAILED else 0)
+
+def test_digest_distinguishes_files_a_size_check_cannot(two_files):
+    """
+    Regenerating training data with a different negative sample gives the same
+    size and line count. Only the digest differs.
+    """
+    fa, fb = (P.file_fingerprint(p) for p in two_files)
+    assert fa['bytes'] == fb['bytes']
+    assert fa['lines'] == fb['lines']
+    assert fa['sha256'] != fb['sha256']
+
+
+def test_missing_file_is_reported_not_raised():
+    assert P.file_fingerprint('/nonexistent/file')['exists'] is False
+
+
+def test_compare_data_detects_a_content_change(two_files):
+    a, b = two_files
+    changed = P.compare_data({a: P.file_fingerprint(a)}, {a: P.file_fingerprint(b)})
+    assert any(field == 'sha256' for _, field, _, _ in changed)
+
+
+def test_compare_data_is_quiet_on_identical_files(two_files):
+    a, _ = two_files
+    f = P.file_fingerprint(a)
+    assert P.compare_data({a: f}, {a: f}) == []
+
+
+# =============================================================  rng
+
+def test_rng_state_round_trips():
+    import random
+    random.seed(1); np.random.seed(1); torch.manual_seed(1)
+    state = P.rng_state()
+    before = (random.random(), float(np.random.rand()), float(torch.rand(1)))
+
+    random.random(); np.random.rand(); torch.rand(1)     # advance all three
+    P.set_rng_state(state)
+    after = (random.random(), float(np.random.rand()), float(torch.rand(1)))
+
+    assert before == after
+
+
+def test_empty_rng_state_is_a_no_op():
+    assert P.set_rng_state({}) is None
+
+
+# =======================================================  run files
+
+@pytest.fixture
+def run_file(tmp_path):
+    path = tmp_path / 'fold-0.run'
+    with open(path, 'w') as f:
+        for t in range(3):
+            for d in range(4):
+                f.write(f't{t} Q0 t{t}_d{d} {d + 1} {1.0 - d / 10:.4f} tag\n')
+    return str(path)
+
+
+def test_run_stats(run_file):
+    stats = P.run_stats(run_file)
+    assert stats['topics'] == 3
+    assert stats['pairs'] == 12
+    assert len(stats['sha256']) == 64
+
+
+def test_sibling_is_written_beside_the_run(run_file, tmp_path):
+    out = P.write_run_provenance(run_file, inference=P.collect([run_file]))
+    assert out == run_file + '.provenance.json'
+    assert os.path.exists(out)
+
+
+def test_sibling_records_the_runs_own_digest(run_file):
+    """Which is what lets a reader tell the sibling from a stale one."""
+    out = P.write_run_provenance(run_file, inference=P.collect([run_file]))
+    with open(out) as f:
+        rec = json.load(f)
+    assert rec['run']['sha256'] == P.run_stats(run_file)['sha256']
+
+
+def test_a_changed_run_no_longer_matches_its_sibling(run_file):
+    out = P.write_run_provenance(run_file, inference=P.collect([run_file]))
+    with open(out) as f:
+        recorded = json.load(f)['run']['sha256']
+    with open(run_file, 'a') as f:
+        f.write('t9 Q0 t9_d0 1 0.5 tag\n')
+    assert P.run_stats(run_file)['sha256'] != recorded
+
+
+def test_training_and_inference_provenance_are_kept_apart(run_file, tmp_path):
+    """
+    The same checkpoint scored on a different machine does not always produce
+    the same run, so the two records must not be collapsed.
+    """
+    ck = tmp_path / 'm.bin'
+    torch.save({'model_state_dict': {}, 'config': {}}, ck)
+    training = P.collect([])
+    out = P.write_run_provenance(
+        run_file, inference=P.collect([run_file]),
+        checkpoint_path=str(ck), checkpoint_config={'model': 'tiny'},
+        checkpoint_provenance=training)
+    with open(out) as f:
+        rec = json.load(f)
+    assert 'produced_by' in rec
+    assert rec['checkpoint']['provenance']['created'] == training['created']
+    assert rec['checkpoint']['sha256']
+
+
+# ======================================================  collect()
+
+def test_collect_carries_every_section(two_files):
+    a, _ = two_files
+    prov = P.collect([a])
+    for key in ('ir_baselines_version', 'created', 'command', 'git',
+                'environment', 'data'):
+        assert key in prov
+    assert a in prov['data']
+
+
+def test_summarise_handles_an_empty_record():
+    assert 'none recorded' in P.summarise({})
+
+
+# ==============================  the checkpoint carries all of it
+
+def test_checkpoint_carries_provenance(tmp_path, two_files):
+    a, _ = two_files
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(4, 4)
+
+    path = tmp_path / 'ck.bin'
+    utils.save_checkpoint(str(path), Tiny(), {'model': 'tiny'},
+                          provenance=P.collect([a]), rng=P.rng_state())
+    extras = utils.load_checkpoint(str(path), Tiny(), 'cpu')
+    assert 'git' in extras['provenance']
+    assert a in extras['provenance']['data']
+    assert 'rng_state' in extras

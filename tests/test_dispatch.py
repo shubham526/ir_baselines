@@ -1,89 +1,103 @@
 """
-The trainer calls model(*[batch[k] for k in TENSOR_KEYS[ENCODING]]), so the
-key order must match each forward() signature exactly. Reordering either
-silently feeds tensors into the wrong parameters.
+The dispatch layer: each model declares how a batch reaches it and which
+objective its output feeds, and the rest of the pipeline reads those.
+
+The first test here guards a hazard that has no other detection: the trainer
+calls `model(*[batch[k] for k in TENSOR_KEYS[ENCODING]])`, passing tensors
+POSITIONALLY. If a forward signature and the key order ever disagree, tensors
+land in the wrong parameters, and with compatible shapes that produces wrong
+numbers rather than an error.
 """
-import sys, types, inspect, torch
-stub = types.ModuleType('transformers')
-class _Cfg:
-    hidden_size = 8; model_type = 'bert'
-    @classmethod
-    def from_pretrained(cls, *a, **k): return cls()
-class _M:
-    @classmethod
-    def from_pretrained(cls, *a, **k): return torch.nn.Identity()
-stub.AutoConfig = _Cfg; stub.AutoModel = _M
-stub.DistilBertModel = type('DistilBertModel', (), {})
-stub.T5EncoderModel = type('T5EncoderModel', (), {})
-sys.modules['transformers'] = stub
+
+import inspect
+
+import pytest
+import torch
 
 from ir_baselines.data.dataset import TENSOR_KEYS
-from ir_baselines.models import REGISTRY
+from ir_baselines.models import MODEL_CHOICES, REGISTRY, spec_for
+from ir_baselines.trainer import LOSS_CHOICES, Trainer
 
-bad = 0
-seen = set()
-for name, spec in REGISTRY.items():
-    if spec.cls in seen:
-        continue
-    seen.add(spec.cls)
-    params = [p for p in inspect.signature(spec.cls.forward).parameters
-              if p != 'self']
-    keys = list(TENSOR_KEYS[spec.cls.ENCODING])
-    ok = params == keys
-    if not ok: bad += 1
-    print(f"  {'PASS' if ok else 'FAIL'}  {spec.cls.__name__:<14} "
-          f"ENCODING={spec.cls.ENCODING}")
-    print(f"        forward params : {params}")
-    print(f"        TENSOR_KEYS    : {keys}")
-
-print()
-
-# --- the Trainer must refuse an objective the model cannot consume ---------
-print('Objective compatibility')
-from ir_baselines.trainer import Trainer, LOSS_CHOICES
+MODEL_CLASSES = sorted({spec.cls for spec in REGISTRY.values()}, key=lambda c: c.__name__)
 
 
-class _Stub:
-    def __init__(self, encoding, supports):
+@pytest.mark.parametrize('cls', MODEL_CLASSES, ids=lambda c: c.__name__)
+def test_forward_signature_matches_batch_key_order(cls):
+    params = [p for p in inspect.signature(cls.forward).parameters if p != 'self']
+    assert params == list(TENSOR_KEYS[cls.ENCODING])
+
+
+@pytest.mark.parametrize('cls', MODEL_CLASSES, ids=lambda c: c.__name__)
+def test_contract_attributes_are_coherent(cls):
+    assert cls.ENCODING in TENSOR_KEYS
+    assert cls.LOSS in LOSS_CHOICES
+    # in-batch training needs separate representations to cross-score
+    assert cls.SUPPORTS_INBATCH == hasattr(cls, 'score_matrix')
+
+
+@pytest.mark.parametrize('cls', MODEL_CLASSES, ids=lambda c: c.__name__)
+def test_every_model_implements_the_contract(cls):
+    for method in ('forward', 'score', 'config_dict'):
+        assert callable(getattr(cls, method, None)), f'{cls.__name__} lacks {method}'
+
+
+@pytest.mark.parametrize('name', MODEL_CHOICES)
+def test_registry_entries_are_well_formed(name):
+    spec = spec_for(name)
+    assert spec.cls in MODEL_CLASSES
+    assert spec.summary
+    from ir_baselines.models import ENCODER_MAP
+    assert spec.encoder in ENCODER_MAP
+
+
+def test_unknown_model_is_rejected_with_the_options():
+    with pytest.raises(KeyError, match='unknown model'):
+        spec_for('colbert')
+
+
+# =======================================  objective / encoding compatibility
+
+class _StubModel:
+    """Only the attributes the Trainer dispatches on."""
+
+    def __init__(self, encoding, supports_inbatch):
         self.ENCODING = encoding
-        self.SUPPORTS_INBATCH = supports
+        self.SUPPORTS_INBATCH = supports_inbatch
 
     def parameters(self):
         return iter([torch.nn.Parameter(torch.zeros(1))])
 
 
-def _build(model, loss):
+def _build_trainer(model, loss):
     return Trainer(model=model, optimizer=None, criterion=None, scheduler=None,
                    metric='map', data_loader=[], device=torch.device('cpu'),
                    loss=loss)
 
 
-cases = [
+@pytest.mark.parametrize('encoding,supports,loss,accepted', [
     ('pair', False, 'cross-entropy', True),
     ('pair', False, 'bce', False),
     ('pair', False, 'ce-inbatch', False),
     ('dual', True, 'bce', True),
     ('dual', True, 'ce-inbatch', True),
     ('dual', True, 'cross-entropy', False),
-]
-for encoding, supports, loss, should_work in cases:
-    try:
-        _build(_Stub(encoding, supports), loss)
-        got = True
-    except ValueError:
-        got = False
-    ok = got == should_work
-    if not ok:
-        bad += 1
-    verdict = 'accepted' if got else 'rejected'
-    print(f"  {'PASS' if ok else 'FAIL'}  {encoding:<5} + {loss:<14} {verdict}")
+])
+def test_objective_compatibility(encoding, supports, loss, accepted):
+    model = _StubModel(encoding, supports)
+    if accepted:
+        assert _build_trainer(model, loss) is not None
+    else:
+        with pytest.raises(ValueError):
+            _build_trainer(model, loss)
 
-try:
-    _build(_Stub('dual', True), 'nonsense')
-    print('  FAIL  unknown loss accepted'); bad += 1
-except ValueError:
-    print('  PASS  unknown loss rejected')
 
-print()
-print('ALL CHECKS PASSED' if not bad else f'{bad} FAILED')
-sys.exit(1 if bad else 0)
+def test_unknown_loss_is_rejected():
+    with pytest.raises(ValueError, match='loss must be one of'):
+        _build_trainer(_StubModel('dual', True), 'nonsense')
+
+
+def test_inbatch_refused_when_the_model_cannot_cross_score():
+    """A cross-encoder has no separate query and document representations."""
+    from ir_baselines.trainer import inbatch_scores
+    with pytest.raises(TypeError, match='encodes the query and document together'):
+        inbatch_scores(_StubModel('pair', False), {}, torch.device('cpu'))
