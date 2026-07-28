@@ -167,8 +167,19 @@ def file_fingerprint(path: str, digest: bool = True,
     lines = 0
     h = hashlib.sha256() if digest else None
     read = 0
+    # A training file runs to gigabytes and hashing it is not instant, so it
+    # reports progress rather than appearing to hang at startup. Below a few
+    # hundred megabytes the bar is more noise than help.
+    show = size > (256 << 20)
+    bar = None
+    if show:
+        from tqdm import tqdm as _tqdm
+        bar = _tqdm(total=size, unit='B', unit_scale=True, unit_divisor=1024,
+                    desc=f'hashing {os.path.basename(path)}', leave=False)
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(1 << 20), b''):
+            if bar is not None:
+                bar.update(len(chunk))
             lines += chunk.count(b'\n')
             if h is not None:
                 if max_digest_bytes is None:
@@ -176,6 +187,8 @@ def file_fingerprint(path: str, digest: bool = True,
                 elif read < max_digest_bytes:
                     h.update(chunk[:max_digest_bytes - read])
             read += len(chunk)
+    if bar is not None:
+        bar.close()
     info['lines'] = lines
     if h is not None:
         info['sha256'] = h.hexdigest()
