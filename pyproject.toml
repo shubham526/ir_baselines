@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ir-baselines"
+name = "ir_baselines"
 version = "2.0.0"
 description = "Neural re-ranking baselines used in the DREQ (ECIR 2024) and QDER (SIGIR 2025) papers"
 readme = "README.md"
@@ -20,7 +20,7 @@ classifiers = [
 dependencies = [
     "torch>=1.13",
     "transformers>=4.20",
-    "pytrec-eval",
+    "ir_measures",
     "tqdm",
     "numpy",
     "scikit-learn",
@@ -28,9 +28,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+data = ["ir_datasets"]
 
 [project.urls]
-Homepage = "https://github.com/shubham526/ir-baselines"
+Homepage = "https://github.com/shubham526/ir_baselines"
 DREQ = "https://github.com/shubham526/ECIR2024-DREQ"
 QDER = "https://github.com/shubham526/SIGIR2025-QDER"
 
@@ -42,6 +43,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# So that `pytest` works from the repository root without an editable install
+# or a PYTHONPATH. An installed package still takes precedence, which is the
+# point of the src layout.
+pythonpath = ["src"]
 # -ra reports why anything was skipped or failed; the default hides it.
 addopts = "-ra"
 markers = [

@@ -11,6 +11,7 @@ the point is that the pipeline is wired correctly and the guards fire.
 """
 
 import json
+import os
 import subprocess
 import sys
 
@@ -19,10 +20,23 @@ import pytest
 pytestmark = pytest.mark.slow
 
 
-def run_cli(module, *args, expect_ok=True):
-    """Invoke an entry point the way a user would, and check its exit status."""
+def run_cli(module, *args, expect_ok=True, env=None):
+    """
+    Invoke an entry point the way a user would, and check its exit status.
+
+    The child gets the parent's sys.path through PYTHONPATH. pytest's
+    `pythonpath` setting only affects the pytest process, so without this the
+    subprocess cannot import the package unless it happens to be installed --
+    and these tests would then be silently testing an installed copy rather
+    than the working tree.
+    """
+    child_env = dict(os.environ)
+    child_env['PYTHONPATH'] = os.pathsep.join(
+        [p for p in sys.path if p] + [child_env.get('PYTHONPATH', '')]).rstrip(os.pathsep)
+    if env:
+        child_env.update(env)
     proc = subprocess.run([sys.executable, '-m', f'ir_baselines.{module}', *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=child_env)
     if expect_ok and proc.returncode != 0:
         pytest.fail(f'{module} exited {proc.returncode}\n'
                     f'--- stdout\n{proc.stdout[-2000:]}\n'

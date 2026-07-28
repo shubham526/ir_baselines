@@ -201,12 +201,12 @@ def main():
         print(f'Scored {len(scored)} of {len(qrels_topics)} qrels topics.')
         if scored != qrels_topics:
             unscored = qrels_topics - scored
-            print(f'WARNING  {len(unscored)} qrels topics were not scored '
-                  f'(e.g. {sorted(unscored)[:5]}). pytrec_eval averages over the '
-                  f'topics present, so this figure is NOT comparable to trec_eval -c.')
-        for m in ('map', 'ndcg_cut_20', 'P_20', 'recip_rank'):
+            print(f'NOTE  {len(unscored)} qrels topics are absent from the run '
+                  f'(e.g. {sorted(unscored)[:5]}) and count as unretrieved, '
+                  f'which is what trec_eval -c does.')
+        for m in metrics.DEFAULT_MEASURES:
             if m in agg:
-                print(f'  {m:<12} {agg[m]:.4f}')
+                print(f'  {m:<10} {agg[m]:.4f}')
 
 
 if __name__ == '__main__':

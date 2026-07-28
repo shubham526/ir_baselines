@@ -37,10 +37,14 @@ def train(model, trainer, epochs, metric, qrels, valid_loader, save_path, save,
         run_path = os.path.join(save_path, run_file)
         utils.save_trec(run_path, res_dict)
 
-        # Fatal, not a warning. An incomplete validation run scores HIGHER,
-        # because pytrec_eval averages over the topics present, so a run that
-        # loses the hard topics would be selected as the best checkpoint.
-        agg = metrics.require_full_coverage(qrels, run_path, context='validation run')
+        # Fatal, not a warning. Scoring is `-c`, so topics absent from the run
+        # count as unretrieved and the figure is depressed rather than
+        # inflated -- but a checkpoint should not be selected on a run that is
+        # quietly missing topics either way, and the validation qrels being
+        # the wrong ones is the usual cause. build_data writes them per fold.
+        agg = metrics.require_full_coverage(
+            qrels, run_path, context='validation run',
+            measures=tuple(dict.fromkeys((metric, *metrics.DEFAULT_MEASURES))))
         valid_metric = agg[metric]
 
         history['epoch'].append(epoch + 1)
@@ -111,8 +115,11 @@ def main():
                              'the checkpoint was trained on.')
     parser.add_argument('--run', help='Validation run filename. Default: dev.run',
                         default='dev.run', type=str)
-    parser.add_argument('--metric', help='Validation metric. Default: map',
-                        default='map', type=str)
+    parser.add_argument('--metric', default='AP', type=str,
+                        help='Validation metric, as an ir_measures name: AP, '
+                             'nDCG@20, P@20, RR. The trec_eval spellings (map, '
+                             'ndcg_cut_20, P_20, recip_rank) are accepted as '
+                             'aliases. Default: AP')
     parser.add_argument('--loss', choices=LOSS_CHOICES, default=None,
                         help="Training objective. Defaults to the one the model expects: "
                              "'cross-entropy' for cross-encoders, 'bce' for multi-vector "
