@@ -53,6 +53,25 @@ import sys
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from tqdm import tqdm
+
+
+def _by_bytes(path: str, desc: str):
+    """
+    A progress bar measured in bytes rather than lines.
+
+    A corpus is several gigabytes and a line count gives no sense of how far
+    through it is; the file size is known up front, so the bar can show a real
+    percentage and time remaining.
+    """
+    total = os.path.getsize(path)
+    bar = tqdm(total=total, unit='B', unit_scale=True, unit_divisor=1024, desc=desc)
+    with open(path) as f:
+        for line in f:
+            bar.update(len(line))
+            yield line
+    bar.close()
+
 NEGATIVE_SAMPLING = ('top', 'random')
 
 
@@ -67,8 +86,8 @@ def read_run(path: str) -> Dict[str, List[Tuple[str, float]]]:
     """
     run: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
     seen: Dict[str, set] = defaultdict(set)
-    with open(path) as f:
-        for n, line in enumerate(f, start=1):
+    if True:
+        for n, line in enumerate(_by_bytes(path, 'run'), start=1):
             parts = line.split()
             if len(parts) < 5:
                 if line.strip():
@@ -89,8 +108,8 @@ def read_run(path: str) -> Dict[str, List[Tuple[str, float]]]:
 
 def read_qrels(path: str) -> Dict[str, Dict[str, int]]:
     qrels: Dict[str, Dict[str, int]] = defaultdict(dict)
-    with open(path) as f:
-        for n, line in enumerate(f, start=1):
+    if True:
+        for n, line in enumerate(_by_bytes(path, 'qrels'), start=1):
             parts = line.split()
             if not parts:
                 continue
@@ -207,17 +226,17 @@ def doc_text(d, field: Optional[str] = None, with_title: bool = True) -> str:
     return body.strip()
 
 
-def read_jsonl(path: str):
+def read_jsonl(path: str, desc: Optional[str] = None):
     """Parsed objects from a JSONL file, blank lines skipped."""
-    with open(path) as f:
-        for n, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(f'{path}:{n}: {e}') from None
+    source = _by_bytes(path, desc) if desc else open(path)
+    for n, line in enumerate(source, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(f'{path}:{n}: {e}') from None
 
 
 class TextSource:
@@ -249,14 +268,15 @@ class TextSource:
                     '    pip install "ir-baselines[data]"\n'
                     'or supply --queries and --docs instead.') from None
             ds = ir_datasets.load(dataset)
-            for q in ds.queries_iter():
+            for q in tqdm(ds.queries_iter(), desc='queries'):
                 self.queries[q.query_id] = query_text(q, query_field)
             self._docs_store = ds.docs_store()
             print(f'{len(self.queries):,} queries from {dataset}')
 
         if queries_file:
             for parts in (line.rstrip('\n').split('\t')
-                          for line in open(queries_file) if line.strip()):
+                          for line in _by_bytes(queries_file, 'queries')
+                          if line.strip()):
                 if len(parts) < 2:
                     raise SystemExit(
                         f'{queries_file}: expected "query_id<TAB>text"')
@@ -270,7 +290,7 @@ class TextSource:
             # on disk for a candidate set of about forty thousand documents.
             self._docs_local = {}
             seen = skipped = 0
-            for d in read_jsonl(docs_file):
+            for d in read_jsonl(docs_file, desc='corpus'):
                 seen += 1
                 doc_id = d['doc_id']
                 if needed_docs is not None and doc_id not in needed_docs:
@@ -365,9 +385,10 @@ def build_split(topics: Iterable[str],
                 negatives_per_positive: int,
                 sampling: str,
                 rng: random.Random,
-                stats: dict) -> List[str]:
+                stats: dict, desc: str = 'building') -> List[str]:
     lines = []
-    for qid in topics:
+    topics = list(topics)
+    for qid in tqdm(topics, desc=desc, leave=False):
         if qid not in text.queries:
             stats['topics_without_query_text'].add(qid)
             continue
@@ -512,7 +533,7 @@ def main():
         if not ds.has_qrels():
             raise SystemExit(f'{args.dataset} has no qrels; pass --qrels')
         qrels = defaultdict(dict)
-        for q in ds.qrels_iter():
+        for q in tqdm(ds.qrels_iter(), desc='qrels'):
             qrels[q.query_id][q.doc_id] = q.relevance
         qrels = dict(qrels)
     print(f'  {len(qrels):,} topics')
@@ -574,7 +595,8 @@ def main():
                     ('test', test_topics, 0)):
                 stats = fresh_stats()
                 lines = build_split(topics, run, qrels, text, npp,
-                                    args.negative_sampling, rng, stats)
+                                    args.negative_sampling, rng, stats,
+                                    desc=f'fold-{k} {name}')
                 path = os.path.join(args.out, f'fold-{k}', f'{name}.jsonl')
                 write(path, lines)
                 report(name, path, lines, stats)
@@ -592,7 +614,7 @@ def main():
         stats = fresh_stats()
         lines = build_split(sorted(run), run, qrels, text,
                             args.negatives_per_positive,
-                            args.negative_sampling, rng, stats)
+                            args.negative_sampling, rng, stats, desc='building')
         path = os.path.join(args.out, 'data.jsonl')
         write(path, lines)
         report('all', path, lines, stats)
