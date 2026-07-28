@@ -41,6 +41,41 @@ validation uses it. `test.py` offers `--expected-topics` and, with `--qrels`,
 compares the topic *sets* — the right count with the wrong ids passes a count
 check and fails this one.
 
+### A metric computed under the wrong convention
+
+Two independent conventions decide what a number means, and neither is visible
+in the number.
+
+**Which topics are averaged over.** `trec_eval -c` averages over the topics in
+the qrels; without it, only the topics present in the run. Under the second, a
+run that loses its hard topics reports a BETTER figure, so where that figure
+selects a checkpoint, the model that lost the most topics wins. Scoring here is
+through ir_measures, which does `-c` by default; `require_full_coverage` is a
+second line rather than the only one.
+
+**Whether unjudged documents count.** `trec_eval -J` removes them from the
+ranking; without it they count as non-relevant. Where the judgment pool is
+shallow the difference is large — on one CODEC fold the same run reads AP 0.083
+one way and 0.322 the other. `--judged-only` selects it, and it applies to
+validation as well as evaluation: a checkpoint chosen under one convention and
+reported under the other is not the checkpoint the number describes. The choice
+is recorded in the checkpoint config, since it changes what `best_metric` means.
+
+Neither convention is right in general. Each collection is reported under one
+of them, and the figure has to be computed the same way to be comparable.
+
+### A candidate whose text is missing
+
+`build_data` needs the text of every candidate. A corpus assembled separately
+from the run can be missing documents the run refers to, and those pairs are
+then absent from the training data and from the run that follows — quietly, and
+in a way that looks like a shorter collection rather than an error.
+
+`retrieve search --save-corpus` writes the run and the corpus from the same
+index in the same command, so the two cannot disagree. Where a corpus is
+supplied separately, the count of candidates that had no text is reported
+rather than left to be inferred.
+
 ### A checkpoint that loads cleanly into the wrong architecture
 
 `load_state_dict(strict=True)` catches renamed and missing parameters. It does
@@ -205,3 +240,5 @@ Where proceeding would produce a number that looks fine and is not:
 | `--resume` when the input files' digests differ | The optimiser trajectory was fitted to different data. |
 | `--resume` from a checkpoint with no training state | The optimiser and schedule would restart, which is a different run. |
 | `--resume` together with `--init-checkpoint` | They mean opposite things: continue a run, or start one from existing weights. |
+| an ambiguous query field | On Robust04, title and description are two different published query sets; defaulting either way produces the wrong experiment silently. |
+| `--positives-only` on evaluation data | A test run covering fewer documents than the systems it is compared against is not comparable to them. |

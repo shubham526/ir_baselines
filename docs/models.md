@@ -20,6 +20,12 @@ listed separately because those are the systems as usually named, and because
 `--model rankt5` is a clearer thing to type than a class name plus an encoder
 flag.
 
+`--pretrain` takes a short name from the table, a path to a local model
+directory, or a hub id. Further short names can be registered through the
+`IR_BASELINES_ENCODERS` environment variable, as a JSON object mapping name to
+path — useful for a locally fine-tuned encoder, and it survives into the
+subprocesses the end-to-end tests spawn.
+
 ---
 
 ## The contract

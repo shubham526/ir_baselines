@@ -10,6 +10,31 @@ versions.** Use the `v1.0-as-published` tag for those, and see
 
 ### Added
 
+- **`build_data`**, turning a candidate run into the training, validation and
+  test JSONL the models consume, one fold tree per invocation. Queries and
+  documents come from ir_datasets or from local files. Per-split qrels are
+  written beside each fold, because validation scores the dev run and the full
+  collection qrels would count every other fold's topics as unretrieved.
+  Sampling is two flags rather than one: `--negatives-per-positive` for the
+  ratio, `--negative-sampling` for which negatives. Test data is never sampled.
+- **`retrieve`**, with `index` and `search` subcommands: build a Lucene index
+  with Pyserini and retrieve a candidate run from it, by BM25, BM25+RM3,
+  BM25+Rocchio, or BM25 followed by a trained checkpoint from this package.
+  `--save-corpus` writes the corpus subset alongside the run, from the same
+  index in the same command, so `build_data` cannot find a candidate whose text
+  is missing.
+- **`inspect`**, reading the provenance of a checkpoint or a run and warning
+  when a run has changed since its sibling was written.
+- **`--judged-only`**, scoring with unjudged documents removed from the ranking
+  rather than counted as non-relevant — `trec_eval -J`. Some collections are
+  reported that way, and where the judgment pool is shallow the conventions are
+  far apart: on one CODEC fold the same run reads AP 0.083 under `-c` and 0.322
+  under `-Jc`. Applies to validation as well as evaluation, and is recorded in
+  the checkpoint, since it changes what the metric means.
+- **`--pretrain` accepts a path or a hub id**, not only a registered short
+  name, and further names can be registered through `IR_BASELINES_ENCODERS`.
+  Local and fine-tuned encoders were previously unusable without editing the
+  package.
 - **Provenance in every checkpoint.** Git commit, branch and dirty flag with
   the modified file list; python, torch, CUDA, cuDNN, transformers and numpy
   versions; GPU names, hostname and platform; the full command line, working
@@ -49,9 +74,22 @@ versions.** Use the `v1.0-as-published` tag for those, and see
   the batch key order the trainer uses. The trainer passes tensors
   positionally, so a mismatch feeds them into the wrong parameters.
 - **`tests/test_provenance.py`**, and eight more assertions in the smoke suite.
+- **Progress on long reads.** The corpus read in `build_data` is minutes of
+  silence on a real collection, and hashing a multi-gigabyte training file at
+  startup looked like a hang. Both report progress, measured in bytes rather
+  than lines.
 
 ### Changed
 
+- **Evaluation moved from pytrec_eval to ir_measures**, which averages over the
+  topics in the qrels rather than the topics present in the run. That is
+  `trec_eval -c`, and it is the safe default: under the other convention a run
+  that loses its hard topics reports a *better* number, and where that number
+  selects a checkpoint, the model that lost the most topics wins. The two agree
+  exactly on a complete run. Measures are now ir_measures names — `nDCG@20`,
+  `AP` — with the trec_eval spellings kept as aliases. The qrels evaluator is
+  cached per file, since validation re-scored against the same qrels every
+  epoch.
 - **One codebase for both families.** Each model declares `ENCODING`, `LOSS`
   and `SUPPORTS_INBATCH` and implements `score()`; the dataset, trainer and
   evaluator read those rather than branching on the model name. Previously the

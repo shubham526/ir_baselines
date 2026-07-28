@@ -122,6 +122,11 @@ CODEC is scored `-Jc` in both papers, for every system including the
 baselines. It is applied uniformly within the collection, so no comparison
 inside a table is affected — but the flag must be used.
 
+In this package that is `--judged-only`, on both `train` and `test`. Without
+it the figures are computed under `-c` and are not comparable to the published
+ones: on one CODEC fold the same run reads AP 0.083 under `-c` and 0.322 under
+`-Jc`.
+
 ---
 
 ## Errata

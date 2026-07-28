@@ -3,8 +3,8 @@
 ## Install
 
 ```bash
-git clone https://github.com/<user>/ir-baselines.git
-cd ir-baselines
+git clone https://github.com/<user>/ir_baselines.git
+cd ir_baselines
 pip install -e .
 ```
 
@@ -14,73 +14,172 @@ Everything runs as a module, so it works from any directory once installed:
 python -m ir_baselines.train --list-models
 ```
 
-## Data
-
-One JSON object per line.
-
-```
-train   {"query": "...", "doc": "...", "label": 0}
-test    {"query_id": "301", "doc_id": "FBIS3-10082",
-         "query": "...", "doc": "...", "label": 0}
-```
-
-`query_id` is optional in training and required at test time along with
-`doc_id`, so that a run file can be written. Including `query_id` in training
-matters for `--loss ce-inbatch`: without it, a second positive for the same
-query inside a batch is scored as a negative.
-
-Labels must be 0 or 1 for the pointwise objectives. Graded relevance values
-are rejected at load time rather than silently optimised towards.
-
-## Train and test
+Two extras, optional because most of the package does not need them:
 
 ```bash
-python -m ir_baselines.train \
-  --model rankt5 \
-  --train fold-0/train.jsonl \
-  --dev   fold-0/dev.jsonl \
-  --qrels fold-0/dev.qrels \
+pip install -e ".[data]"        # ir_datasets, for --dataset
+pip install -e ".[retrieval]"   # pyserini, for index and search
+```
+
+Pyserini needs a Java runtime — 21 for recent versions, 11 for older ones. A
+version mismatch gives class-file errors rather than anything obvious, so check
+both:
+
+```bash
+java -version
+python -c "import pyserini; print(pyserini.__version__)"
+```
+
+---
+
+## The pipeline
+
+Five steps. Each writes what the next reads, and you can start at whichever one
+matches what you already have.
+
+### 1. Index a corpus
+
+```bash
+python -m ir_baselines.retrieve index \
+  --docs corpus.jsonl --index ./lucene --threads 16
+```
+
+`corpus.jsonl` is one object per line with `doc_id` and a text field. Pyserini
+wants a different shape, so the conversion is done for you and streamed, since
+a collection corpus is usually larger than memory.
+
+`--dataset <ir_datasets id>` indexes a collection from ir_datasets instead.
+
+The index is built with `--storeRaw`, which is what lets step 2 read document
+text back out. Skip it and `--save-corpus` produces nothing.
+
+### 2. Retrieve a candidate run
+
+```bash
+python -m ir_baselines.retrieve search \
+  --index ./lucene --queries queries.tsv \
+  --method bm25+rm3 --k 1000 \
+  --out bm25_rm3.run --save-corpus corpus.subset.jsonl
+```
+
+| `--method` | |
+|---|---|
+| `bm25` | BM25 alone |
+| `bm25+rm3` | with RM3 pseudo-relevance feedback; the usual candidate ranking here |
+| `bm25+rocchio` | with Rocchio feedback |
+| `bm25+rerank` | BM25 then re-ranked by a trained checkpoint from this package |
+
+**`--save-corpus` is worth using.** It writes `{doc_id, text}` for exactly the
+documents in the run, from the same index in the same command. Step 3 needs
+that text, and a corpus assembled separately can be missing documents the run
+refers to — those candidates are then dropped without comment. It also avoids
+reading a whole collection to use a small part of it: CODEC's corpus is 4.3 GB
+for a candidate set of about forty thousand documents.
+
+Tune `--k1` and `--b` if you have values for the collection. The defaults are
+Pyserini's, not tuned, and a re-ranker inherits whatever its first stage gives
+it.
+
+### 3. Build the data
+
+```bash
+python -m ir_baselines.build_data \
+  --run bm25_rm3.run --queries queries.tsv --docs corpus.subset.jsonl \
+  --qrels qrels.txt --folds folds.json --out data/
+```
+
+writes, per fold:
+
+```
+data/fold-0/train.jsonl
+data/fold-0/dev.jsonl     data/fold-0/dev.qrels
+data/fold-0/test.jsonl    data/fold-0/test.qrels
+```
+
+**The per-split qrels matter.** Validation scores the dev run; passing the full
+collection qrels means every topic in the other folds counts as unretrieved,
+which training refuses.
+
+**Sampling is two decisions, and they are two flags.**
+`--negatives-per-positive` sets the ratio, defaulting to 1 because that is what
+the published experiments used — a convention, not a validated choice.
+`--negative-sampling` chooses which negatives, defaulting to `top`, which takes
+a prefix of the run and so trains against the highest-ranked non-relevant
+documents. That second choice does more work than the ratio.
+
+Test data is never sampled: it carries the whole candidate list, because a run
+covering fewer documents than the systems it is compared against is not
+comparable to them.
+
+**Field names differ between collections.** BEIR exposes `text`, native TREC
+exposes `title` and `body`, CORD-19 and nfcorpus expose `abstract`. The field is
+resolved per dataset, and where the choice is ambiguous it is refused rather
+than guessed — on Robust04, `--query-field title` and `--query-field
+description` are two different published query sets, and defaulting either way
+would silently produce the wrong experiment.
+
+### 4. Train
+
+```bash
+python -m ir_baselines.train --model rankt5 \
+  --train data/fold-0/train.jsonl --dev data/fold-0/dev.jsonl \
+  --qrels data/fold-0/dev.qrels \
   --save-dir out/rankt5/fold-0 \
-  --epoch 10 --batch-size 16 --learning-rate 1e-5 \
-  --use-cuda
-
-python -m ir_baselines.test \
-  --model rankt5 \
-  --test fold-0/test.jsonl \
-  --checkpoint out/rankt5/fold-0/model.bin \
-  --save-dir runs/rankt5 --run fold-0.run \
-  --qrels fold-0/test.qrels \
-  --use-cuda
+  --epoch 10 --batch-size 16 --learning-rate 1e-5 --use-cuda
 ```
 
-`--model` names the system. `--pretrain` overrides the encoder it wraps, and
-`--loss` overrides the objective where the model supports more than one;
-neither is needed for the usual configuration.
-
-Five folds at once:
-
-```bash
-MODEL=rankt5 DATA=./fold_data QRELS=./qrels.txt OUT=./runs \
-  bash scripts/run_5fold.sh
-```
-
-## Which arguments matter for which model
-
-`python -m ir_baselines.train --list-models` prints the encoding and objective
-for each model, which is what determines the relevant flags.
+`--model` names the system; `--list-models` prints what is available with each
+one's encoding and objective. `--pretrain` overrides the encoder — a short name,
+a path to a local model directory, or a hub id. `--loss` overrides the objective
+where the model supports more than one.
 
 | Encoding | Length flags | Objective |
 |---|---|---|
 | `pair` (cross-encoders) | `--max-len` | `cross-entropy` |
 | `dual` (multi-vector) | `--max-query-len`, `--max-doc-len` | `bce` or `ce-inbatch` |
 
-Passing a flag that does not apply prints a note rather than failing, except
-where it would change the result: an objective the model cannot consume is
-refused.
+A flag that does not apply prints a note; an objective the model cannot consume
+is refused.
+
+### 5. Evaluate
+
+```bash
+python -m ir_baselines.test --model rankt5 \
+  --test data/fold-0/test.jsonl --checkpoint out/rankt5/fold-0/model.bin \
+  --save-dir runs/rankt5 --run fold-0.run \
+  --qrels data/fold-0/test.qrels --use-cuda
+```
+
+Five folds at once:
+
+```bash
+MODEL=rankt5 DATA=./data QRELS=./qrels.txt OUT=./runs bash scripts/run_5fold.sh
+```
+
+---
+
+## Scoring conventions
+
+Scoring is through ir_measures, which averages over the topics in the **qrels**
+rather than the topics present in the run — `trec_eval -c`. Under the other
+convention a run that loses its hard topics reports a *better* number.
+
+`--judged-only` switches to `trec_eval -J`: unjudged documents are removed from
+the ranking rather than counted as non-relevant. Where the judgment pool is
+shallow the two are far apart — on one CODEC fold the same run reads AP 0.083
+under `-c` and 0.322 under `-Jc`.
+
+Use whichever the collection is reported under, and use it for **both**
+validation and evaluation, or the checkpoint is selected under one convention
+and reported under another. The choice is recorded in the checkpoint, since it
+changes what the metric means.
+
+`--metric` takes ir_measures names — `AP`, `nDCG@20`, `P@20`, `RR` — with the
+trec_eval spellings (`map`, `ndcg_cut_20`, `P_20`, `recip_rank`) as aliases.
+
+---
 
 ## What a checkpoint carries
-
-A checkpoint is not just weights. Alongside `model_state_dict` it stores:
 
 | | |
 |---|---|
@@ -91,110 +190,70 @@ A checkpoint is not just weights. Alongside `model_state_dict` it stores:
 | `epoch`, `best_metric`, `history` | where the run got to |
 | `rng_state` | python, numpy, torch and CUDA generators |
 
-All of it travels inside the checkpoint rather than in sibling files, so a
-checkpoint that is copied or renamed keeps its provenance.
-
-Inspecting one:
-
-```python
-import torch
-ck = torch.load('out/model.bin', weights_only=False)
-print(ck['provenance']['git']['describe'])       # which code
-print(ck['provenance']['environment']['transformers'])
-print(ck['provenance']['data'])                  # which data, by digest
-print(ck['epoch'], ck['best_metric'])
+```bash
+python -m ir_baselines.inspect out/rankt5/fold-0/model.bin
+python -m ir_baselines.inspect runs/rankt5/fold-0.run
+python -m ir_baselines.inspect runs/rankt5/fold-0.run --json
 ```
 
-`test.py` prints a summary of the provenance when it loads a checkpoint. That
-is not a check — a different commit or environment is not an error — but it is
-the first thing worth knowing when a number does not match.
+For a run this prints the whole chain — run, what produced it, the checkpoint,
+and what trained that checkpoint — and warns if the run has changed since its
+provenance sibling was written.
 
 ### The configuration is verified, and that matters
 
 Several mismatches load with every key matched and no warning:
 
 - **Tower topology.** With `--shared-encoder true` the query and document
-  encoders are the same module, so `state_dict()` still emits both key names.
-  A separate-tower checkpoint loads into a tied model with every key matched,
+  encoders are the same module, so `state_dict()` still emits both key names. A
+  separate-tower checkpoint loads into a tied model with every key matched,
   silently overwriting one tower with the other.
-- **T5 pooling.** Not a parameter at all, so nothing in the state dict
-  reflects it. A checkpoint trained with `mean-all` and evaluated with
-  `masked-mean` produces different scores throughout.
-- **Sequence lengths.** A model trained at 512 tokens and evaluated at 250
-  sees truncated documents and reports a lower figure with no indication why.
+- **T5 pooling.** Not a parameter at all, so nothing in the state dict reflects
+  it. A checkpoint trained with `mean-all` and evaluated with `masked-mean`
+  produces different scores throughout.
+- **Sequence lengths.** A model trained at 512 tokens and evaluated at 250 sees
+  truncated documents and reports a lower figure with no indication why.
 
-If a checkpoint carries no configuration, inference refuses rather than
-guessing. `--allow-unverified-checkpoint` overrides that.
+A checkpoint carrying no configuration is refused unless
+`--allow-unverified-checkpoint` is passed.
 
 ### Why the data digest
 
-Regenerating training data with a different negative sample gives a file of
-the same size and line count and different contents. A path, a size and a line
-count all match; only the digest does not. `--resume` compares them and
-refuses to continue an optimiser trajectory fitted to different data unless
-`--allow-data-change` is passed.
+Regenerating training data with a different negative sample gives a file of the
+same size and line count and different contents. Only the digest differs, and
+`--resume` compares them before continuing an optimiser trajectory fitted to
+different data.
 
-`--no-data-fingerprint` skips the hashing for very large inputs.
+---
 
 ## What a run file carries
 
-A run file cannot carry its own provenance. The TREC format is six
-whitespace-separated fields per line, and every parser — `trec_eval` and
-`pytrec_eval` alike — rejects a comment line. So `test.py` writes a sibling:
+A run file cannot carry its own provenance: the TREC format is six
+whitespace-separated fields per line, and every parser rejects a comment. So
+`test.py` writes a sibling:
 
 ```
-runs/fold-0.run
-runs/fold-0.run.provenance.json
+runs/rankt5/fold-0.run
+runs/rankt5/fold-0.run.provenance.json
 ```
 
-The sibling records the run's own topic count, pair count and **SHA-256**;
-the git commit, environment and test-data digests at inference time; and the
-checkpoint's path, digest, configuration and its own training-time provenance.
-Training and inference provenance are kept apart because they can differ, and
-the difference is often the answer — the same checkpoint scored on a different
-machine, or under a different transformers version, does not always produce
-the same run.
+holding the run's own digest, the inference-time environment, and the
+checkpoint's path, digest, configuration and training-time provenance. The run
+digest is what lets a reader tell whether the sibling belongs to the file in
+front of them.
 
-The run's digest is what lets a reader tell whether the sibling belongs to
-the file in front of them or to an earlier version of it.
+`--tag-commit` puts the short commit in field 6 — `bert.53ccb90` — for a run
+separated from its sibling. It is skipped when tracked files are modified,
+since a hash that does not identify the code is worse than no hash.
 
-`--no-run-provenance` skips it.
-
-### For a run file on its own
-
-A sibling gets separated from its run the moment someone emails one file.
-`--tag-commit` puts the short commit in field 6:
-
-```
-t0 Q0 t0_d0 1 0.5102885365486145 bert.53ccb90
-```
-
-It is skipped when the working tree has modified tracked files, since a hash
-that does not identify the code is worse than no hash. Untracked files do not
-count: a repository almost always has some, and treating those as dirty would
-mean the hash was never usable.
-
-## Reading a provenance record
-
-```bash
-python -m ir_baselines.inspect out/model.bin
-python -m ir_baselines.inspect runs/fold-0.run
-python -m ir_baselines.inspect runs/fold-0.run --json
-```
-
-For a checkpoint this prints the training state, the configuration and the
-provenance. For a run it prints the run's shape, what produced it, and what
-trained the checkpoint behind it — and warns if the run has changed since its
-sibling was written.
+---
 
 ## Resuming an interrupted run
 
-Two checkpoints are written:
-
 | | |
 |---|---|
-| `model.bin` | the **best** model, written only when the validation metric improves. Use this for inference. |
-| `last.bin` | the **latest** state, written at every evaluation. Use this for `--resume`. |
+| `model.bin` | the **best** model, written only when the validation metric improves. Use for inference. |
+| `last.bin` | the **latest** state, written at every evaluation. Use for `--resume`. |
 
 ```bash
 python -m ir_baselines.train ... --epoch 20 --resume out/rankt5/fold-0/last.bin
@@ -206,69 +265,64 @@ would have seen. Restoring the seed alone would reproduce step zero, not the
 step training stopped at.
 
 Resuming from `model.bin` works but discards every epoch since the best one,
-and says so.
+and says so. `--init-checkpoint` is a different thing: it starts a **new** run
+from existing weights.
 
-`--save-last ''` disables the second checkpoint if disk is tight; `--resume`
-then has only the best checkpoint to work from.
+---
 
-`--init-checkpoint` is a different thing: it starts a **new** run from existing
-weights, with the optimiser, schedule and epoch counter all fresh.
-
-## What the output tells you
-
-`test.py` prints the number of examples in the test file against the number of
-pairs written, and warns if they differ. A run that silently loses pairs still
-scores without error and reports a plausible figure, so it is worth reading:
+## Output worth reading
 
 ```
 Run written to runs/rankt5/fold-0.run
   examples in test file : 8995
-  pairs written         : 8995 across 50 topics
+  pairs written         : 8995 across 9 topics
 ```
 
+A run that silently loses pairs still scores and reports a plausible figure.
 `--expected-topics` makes a topic-count mismatch fatal, which is worth using
-when concatenating folds. `--qrels` additionally checks that the topic *sets*
-match, not just the counts: the right number of topics with the wrong ids
-passes a count check and fails this one.
+when concatenating folds; `--qrels` additionally compares the topic *sets*,
+since the right count with the wrong ids passes a count check and fails this
+one.
 
-## Using your own encoder
+---
 
-`--pretrain` takes a short name, a path to a local model directory, or a hub
-id:
+## Reproducibility
+
+Training is seeded: two runs with the same `--seed` produce byte-identical run
+files. `utils.set_seed` also requests deterministic kernels, which costs
+throughput — a deliberate trade.
+
+Some GPU attention implementations are non-deterministic in the backward pass
+and torch warns rather than failing. Inference is unaffected; if bit-exact
+*training* matters, verify it on your hardware:
 
 ```bash
-python -m ir_baselines.train --model bert --pretrain roberta ...
-python -m ir_baselines.train --model bert --pretrain /models/my-bert ...
-python -m ir_baselines.train --model bert --pretrain allenai/scibert_scivocab_uncased ...
+for i in 1 2; do
+  python -m ir_baselines.train --model bert --seed 42 ... --save-dir /tmp/det$i
+done
+python -c "
+import json
+for i in (1,2): print(json.load(open(f'/tmp/det{i}/training_history.json'))['train_loss'])"
 ```
 
-To give a local encoder a short name, including for subprocesses:
+Inference is deterministic regardless. Ties in the run file break by document
+id rather than dictionary order, so equal-scoring documents always rank the
+same way.
 
-```bash
-export IR_BASELINES_ENCODERS='{"my-bert": "/models/my-bert"}'
-python -m ir_baselines.train --model bert --pretrain my-bert ...
-```
+---
 
 ## Tests
 
 ```bash
 pip install -e ".[test]"
-pytest                    # everything
-pytest -m "not slow"      # skip the ones that train
+pytest
+pytest -m "not slow"        # skip the ones that train a model
 ```
 
-Nothing downloads: the end-to-end tests build a two-layer BERT from a config
-and register it through `IR_BASELINES_ENCODERS`.
+Nothing downloads: the encoder tests build a small BERT from a config, so the
+suite runs offline in seconds.
 
-## Reproducibility
-
-Training is seeded. Two runs with the same `--seed` on the same data produce
-byte-identical run files, including identical per-epoch losses.
-
-`utils.set_seed` also requests deterministic kernels and disables cuDNN
-autotuning, which costs throughput. That trade is deliberate: a result that
-cannot be reproduced is worth less than the time it saves.
-
-Inference is deterministic regardless. Ties in the run file are broken by
-document id rather than left to dictionary order, so equal-scoring documents
-always rank the same way.
+If you add a model, `test_dispatch.py` will check that its `forward` signature
+matches the batch key order the trainer uses. That check exists because the
+trainer passes tensors positionally, so a mismatch feeds them into the wrong
+parameters — possibly without a shape error.
