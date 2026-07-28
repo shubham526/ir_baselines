@@ -29,6 +29,8 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7"]
 data = ["ir_datasets"]
+# Pyserini needs a Java runtime (17+), which most of this package does not.
+retrieval = ["pyserini"]
 
 [project.urls]
 Homepage = "https://github.com/shubham526/ir_baselines"
