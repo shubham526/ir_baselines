@@ -396,3 +396,36 @@ def short_commit(n: int = 7) -> Optional[str]:
     if not g.get('available') or g.get('dirty'):
         return None
     return g['commit'][:n]
+
+def write_data_provenance(output_path: str,
+                          inputs: Iterable[Optional[str]] = (),
+                          parameters: Optional[Dict[str, Any]] = None,
+                          script: Optional[str] = None,
+                          digest_output: bool = True) -> str:
+    """
+    Write `<output>.provenance.json` beside a generated data file.
+
+    The chain is otherwise broken at its first link. A checkpoint records the
+    digest of the training file it read, so you can tell whether two runs used
+    the same data -- but nothing records how that file was made, from what, or
+    under which parameters. Derived entity judgments are the sharpest case:
+    the file is the supervision, and the rule that produced it is the thing
+    most worth being able to check later.
+
+    `parameters` should carry the settings that change the output: sampling
+    ratios, thresholds, the rule variant. They are recorded, not verified;
+    nothing downstream can check them, which is why writing them down is the
+    only protection.
+    """
+    record: Dict[str, Any] = {
+        'ir_baselines_version': __import__('ir_baselines').__version__,
+        'script': script or (sys.argv[0] if sys.argv else None),
+        'output': (file_fingerprint(output_path) if digest_output
+                   else {'path': os.path.abspath(output_path)}),
+        'parameters': parameters or {},
+        'produced_by': collect(data_files=inputs),
+    }
+    out_path = output_path + '.provenance.json'
+    with open(out_path, 'w') as f:
+        json.dump(record, f, indent=2, default=str)
+    return out_path
