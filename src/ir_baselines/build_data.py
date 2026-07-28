@@ -232,7 +232,8 @@ class TextSource:
 
     def __init__(self, dataset: Optional[str], queries_file: Optional[str],
                  docs_file: Optional[str], query_field: Optional[str],
-                 doc_field: Optional[str], doc_title: bool = True):
+                 doc_field: Optional[str], doc_title: bool = True,
+                 needed_docs: Optional[set] = None):
         self.queries: Dict[str, str] = {}
         self._docs_local: Optional[Dict[str, str]] = None
         self._docs_store = None
@@ -263,10 +264,26 @@ class TextSource:
             print(f'{len(self.queries):,} queries from {queries_file}')
 
         if docs_file:
+            # Only the documents the run asks for. A collection corpus runs to
+            # several gigabytes of JSON, and holding all of it costs far more
+            # in memory than the candidates actually need -- CODEC's is 4.3 GB
+            # on disk for a candidate set of about forty thousand documents.
             self._docs_local = {}
+            seen = skipped = 0
             for d in read_jsonl(docs_file):
-                self._docs_local[d['doc_id']] = self._local_doc_text(d)
-            print(f'{len(self._docs_local):,} documents from {docs_file}')
+                seen += 1
+                doc_id = d['doc_id']
+                if needed_docs is not None and doc_id not in needed_docs:
+                    skipped += 1
+                    continue
+                self._docs_local[doc_id] = self._local_doc_text(d)
+            print(f'{len(self._docs_local):,} documents kept from {docs_file} '
+                  f'({seen:,} read, {skipped:,} not in the run)')
+            if needed_docs is not None:
+                absent = len(needed_docs) - len(self._docs_local)
+                if absent:
+                    print(f'NOTE  {absent:,} candidate document(s) are not in the '
+                          f'corpus and will be skipped.')
 
         if not self.queries:
             raise SystemExit('no queries: pass --dataset or --queries')
@@ -500,9 +517,15 @@ def main():
         qrels = dict(qrels)
     print(f'  {len(qrels):,} topics')
 
+    # Everything the run refers to, so the corpus can be filtered as it is
+    # read rather than held whole.
+    needed = {doc_id for candidates in run.values() for doc_id, _ in candidates}
+    print(f'  {len(needed):,} distinct documents referenced')
+
     text = TextSource(args.dataset, args.queries, args.docs,
                       args.query_field, args.doc_field,
-                      doc_title=not args.no_doc_title)
+                      doc_title=not args.no_doc_title,
+                      needed_docs=needed)
 
     def fresh_stats():
         return {'positives': 0, 'negatives': 0, 'documents_without_text': 0,
